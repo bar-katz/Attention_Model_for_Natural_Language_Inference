@@ -192,7 +192,7 @@ class AttentionNetwork:
 
 def process_sentence(sentence, from_train=False):
     """
-    Get a sentence as string and convert it indexes.
+    Get a sentence as string and convert it to indexes.
     :param sentence: string
     :param from_train: is sentence from train set
     :return: sentence indexes
