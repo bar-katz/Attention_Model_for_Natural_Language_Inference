@@ -181,8 +181,8 @@ class AttentionNetwork:
         output_vectors = []
 
         for input_vector in input_vectors:
-            output_vectors = dy.rectify(w * input_vector + b)
-            output_vectors.append(output_vectors)
+            output_vector = dy.rectify(w * input_vector + b)
+            output_vectors.append(output_vector)
 
         return output_vectors
 
