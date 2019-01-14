@@ -3,6 +3,7 @@ import dynet as dy
 import time
 import numpy as np
 import pickle
+from sklearn.utils import shuffle
 
 DATA_DIR = 'snli_1.0'
 TRAIN = '/snli_1.0_train.jsonl'
@@ -10,7 +11,7 @@ DEV = '/snli_1.0_dev.jsonl'
 TEST = '/snli_1.0_test.jsonl'
 GLOVE = 'glove.42B.300d.txt'
 
-EPOCHS = 600
+EPOCHS = 10
 RUN_DEV = 500
 LR = 0.01
 NUM_UNK = 100
@@ -19,16 +20,20 @@ EMBEDDING_SIZE = 300
 NUM_LAYERS = 2
 STATE_SIZE = 100
 ATTENTION_SIZE = 100
+LABELS = {'entailment': 0, 'contradiction': 1, 'neutral': 2}
 START = '<s>'
 END = '</s>'
 
 
 class Attention:
-    def __init__(self, vocab_size, embedding_size, num_layers, state_size, attention_size, tag_size):
+    def __init__(self, glove_vectors, word2glove, embedding_size, tag_size, lr):
+        # (self, vocab_size, embedding_size, num_layers, state_size, attention_size, tag_size):
         self.model = dy.Model()
+        self.trainer = dy.AdagradTrainer(self.model, lr)
 
         # Embedding vectors
-        self.embedding = dy.inputTensor(glove_dict)
+        self.embedding = glove_vectors
+        self.w2idx = word2glove
         # self.input_lookup = self.model.add_lookup_parameters((vocab_size + NUM_UNK, embedding_size))
 
         # Feed forward NN encoder F
@@ -38,13 +43,13 @@ class Attention:
         # self.enc_bwd_lstm = dy.LSTMBuilder(num_layers, embedding_size, state_size, self.model)
 
         # Feed Forward NN aligner G
-        self.G_W1 = self.model.add_parameters((2 * embedding_size, embedding_size))
+        self.G_W1 = self.model.add_parameters((embedding_size, 2 * embedding_size))
         self.G_W2 = self.model.add_parameters((embedding_size, embedding_size))
         # self.dec_lstm = dy.LSTMBuilder(num_layers, state_size * 2 + embedding_size, state_size, self.model)
 
         # Feed Forward NN decoder H
-        self.H_W1 = self.model.add_parameters((2 * embedding_size, embedding_size))
-        self.H_W2 = self.model.add_parameters((embedding_size, tag_size))
+        self.H_W1 = self.model.add_parameters((embedding_size, 2 * embedding_size))
+        self.H_W2 = self.model.add_parameters((tag_size, embedding_size))
 
         # self.attention_w1 = self.model.add_parameters((attention_size, state_size * 2))
         # self.attention_w2 = self.model.add_parameters((attention_size, state_size * num_layers * 2))
@@ -54,10 +59,14 @@ class Attention:
 
         self.activation = dy.rectify
 
-    def embed_sentence(self, sentence, word2idx_dict, glove_embedding):
+    def embed_sentence(self, sentence):
         sentence = sentence[:-1]
         sentence = [START] + sentence.split() + [END]
-        return [self.embedding[word2idx_dict[w]] for w in sentence]
+        """for w in sentence:
+            idx = self.w2idx[w]
+            e = self.embedding[idx]
+            e = dy.inputTensor(e)"""
+        return [dy.inputTensor(self.embedding[self.w2idx.get(w, self.w2idx['<UNK/>'])]) for w in sentence]
         """sentence = [word2idx_dict.get(w, 0) for w in sentence]
         return [self.input_lookup[word] for word in sentence]"""
 
@@ -66,7 +75,7 @@ class Attention:
             f_w1 = self.activation(self.F_W1 * dy.dropout(word, 0.85))
             f_w2 = self.activation(self.F_W2 * dy.dropout(f_w1, 0.85))
             return f_w2
-        return [F(w) for w in embed_sent]
+        return dy.concatenate_cols([F(w) for w in embed_sent])
         """fwd_vectors = self.run_lstm(self.enc_fwd_lstm.initial_state(), sentence)
         bwd_vectors = reversed(self.run_lstm(self.enc_bwd_lstm.initial_state(), reversed(sentence)))
         vectors = [dy.concatenate(list(p)) for p in zip(fwd_vectors, bwd_vectors)]
@@ -76,7 +85,7 @@ class Attention:
         sent1_matrix = dy.transpose(encode_sent1) * encode_sent2
         sent2_matrix = dy.transpose(sent1_matrix)
         sent1_weights, sent2_weights = dy.softmax(sent1_matrix), dy.softmax(sent2_matrix)
-        return sent1_weights * encode_sent2, sent2_weights * encode_sent1
+        return sent1_weights * dy.transpose(encode_sent2), sent2_weights * dy.transpose(encode_sent1)
 
     def __call__(self, sent1, sent2):
         dy.renew_cg()
@@ -85,46 +94,47 @@ class Attention:
         attend_sent1, attend_sent2 = self.attend1(encoded_sent1, encoded_sent2)
         v_sent1, v_sent2 = self.compare(encoded_sent1, attend_sent1), self.compare(encoded_sent2, attend_sent2)
         prediction = self.aggregate(v_sent1, v_sent2)
-        return prediction.npvalue()
+        return prediction
 
     def compare(self, sent, v_sent_other):
         def G(vec1, vec2):
             g_w1 = self.activation(self.G_W1 * dy.dropout(dy.concatenate([vec1, vec2]), 0.85))
             g_w2 = self.activation(self.G_W2 * dy.dropout(g_w1, 0.85))
-            return g_w2
-        return dy.sum_cols([G(w, v_soft_align) for w, v_soft_align in zip(sent, v_sent_other)])
+            return dy.transpose(g_w2)
+        return dy.sum_dim(dy.concatenate([G(w, v_soft_align) for w, v_soft_align in zip(dy.transpose(sent), v_sent_other)]), d=[0])
 
     def aggregate(self, v_sent1, v_sent2):
         h_w1 = self.activation(self.H_W1 * dy.concatenate([v_sent1, v_sent2]))
         h_w2 = self.activation(self.H_W2 * h_w1)
         return dy.softmax(h_w2)
 
-    def train(self, train_set, dev_set, word2idx_dict, idx2word_dict, glove_embedding):
-        trainer = dy.AdagradTrainer(self.model, LR)
+    def train(self, train_set, dev_set):
         train_accuracy = []
         dev_accuracy = []
         for epoch in range(1, EPOCHS + 1):
-            print('EPOCH #: ' + str(epoch))
+            print('EPOCH #' + str(epoch) + ':')
             loss_list = []
             correct = 0.0
-            for item in train_set:
-                sent1, sent2, label = item['sentence1'], item['sentence2'], item['gold_label']
+            # need to shuffle data
+            train_set = shuffle(train_set)
+            for item in train_set[:1000]:
+                sent1, sent2, label = item['sentence1'], item['sentence2'], LABELS[item['gold_label']]
                 prediction_vec = self(sent1, sent2)
-                prediction = np.argmax(prediction_vec)
-                loss = dy.pickneglogsoftmax(prediction, label)
+                prediction = np.argmax(prediction_vec.npvalue())
+                loss = dy.pickneglogsoftmax(prediction_vec, label)
                 loss_list.append(loss)
                 loss.backward()
-                trainer.update()
+                self.trainer.update()
                 correct += 1 if prediction == label else 0
             accuracy = str(100 * (correct / len(train_set)))
             train_accuracy.append(accuracy)
             print('Accuracy on train set: ' + accuracy + '%')
 
             correct = 0.0
-            for item in dev_set:
-                sent1, sent2, label = item['sentence1'], item['sentence2'], item['gold_label']
+            for item in dev_set[:500]:
+                sent1, sent2, label = item['sentence1'], item['sentence2'], LABELS[item['gold_label']]
                 prediction_vec = self(sent1, sent2)
-                prediction = np.argmax(prediction_vec)
+                prediction = np.argmax(prediction_vec.npvalue())
                 correct += 1 if prediction == label else 0
             accuracy = str(100 * (correct / len(dev_set)))
             dev_accuracy.append(accuracy)
@@ -147,7 +157,8 @@ def load_data(f_name):
 
 def load_glove(f_name):
     print("Loading Glove Model")
-    return pickle.load(open('new_glove', 'rb'))
+    glove_embeds = pickle.load(open('new_glove', 'rb'))
+    return np.array([vec for vec in glove_embeds.values()]), {v: i for i, v in enumerate(glove_embeds.keys())}
     """with open(f_name, 'r', encoding='utf8') as file:
         model = {}
         for line in file:
@@ -203,12 +214,13 @@ if __name__ == '__main__':
     curr_time = time.time()
     print('Loaded train and dev data in ' + str(curr_time - start_time) + ' seconds\n')
     start_time = curr_time
-    word2idx, idx2word = create_word2idx(train_data)
-    glove_dict = load_glove(GLOVE)
+    # word2idx, idx2word = create_word2idx(train_data)
+    glove_matrix, w2glove = load_glove(GLOVE)
     curr_time = time.time()
-    print('Created word2idx and idx2word dictionaries in ' + str(curr_time - start_time) + 'seconds\n')
-    attention_model = Attention(len(word2idx), EMBEDDING_SIZE, NUM_LAYERS, STATE_SIZE, ATTENTION_SIZE, tag_size=3)
-    train_acc, dev_acc = attention_model.train(train_data, dev_data, word2idx, idx2word, glove_dict)
+    print('Created word2idx and idx2word dictionaries in ' + str(curr_time - start_time) + ' seconds\n')
+    # attention_model = Attention(len(word2idx), EMBEDDING_SIZE, NUM_LAYERS, STATE_SIZE, ATTENTION_SIZE, tag_size=3)
+    attention_model = Attention(glove_matrix, w2glove, EMBEDDING_SIZE, len(LABELS), LR)
+    train_acc, dev_acc = attention_model.train(train_data, dev_data)
 
 
 """def attend(self, input_mat, state, w1dt):
